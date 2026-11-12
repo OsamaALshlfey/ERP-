@@ -114,6 +114,8 @@
       state.user = null;
       state.data = null;
       state.csrf = "";
+      state.journals = null;
+      state.trialBalance = null;
       renderLogin();
     }
   }
@@ -435,9 +437,10 @@
       });
       await submitForm(form, async () => request("/api/journals", {
         method: "POST", headers: { "X-CSRF-Token": state.csrf }, body: JSON.stringify(fields),
-      }), "تم حفظ القيد وترحيله");
-      state.journals = null;
-      state.trialBalance = null;
+      }), "تم حفظ القيد وترحيله", () => {
+        state.journals = null;
+        state.trialBalance = null;
+      });
     };
   }
 
@@ -468,7 +471,7 @@
     }
   }
 
-  async function submitForm(form, action, success) {
+  async function submitForm(form, action, success, afterSuccess = () => {}) {
     const button = form.querySelector('button[type="submit"]');
     const label = button.textContent;
     button.disabled = true;
@@ -476,6 +479,7 @@
     try {
       await action();
       showToast(success);
+      afterSuccess();
       await loadWorkspace();
     } catch (error) {
       showToast(error.message, "error");
