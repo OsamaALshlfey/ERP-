@@ -15,6 +15,7 @@ import sys
 import time
 import zipfile
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -118,6 +119,26 @@ def initialize(db_path: str, initial_password: str | None = None) -> str | None:
                 UNIQUE(company_id, code),
                 CHECK (parent_id IS NULL OR parent_id != id)
             );
+            CREATE TABLE IF NOT EXISTS journal_entries (
+                id INTEGER PRIMARY KEY,
+                company_id INTEGER NOT NULL REFERENCES companies(id),
+                entry_number TEXT NOT NULL,
+                entry_date TEXT NOT NULL,
+                description TEXT NOT NULL,
+                created_by INTEGER NOT NULL REFERENCES users(id),
+                created_at TEXT NOT NULL,
+                UNIQUE(company_id, entry_number)
+            );
+            CREATE TABLE IF NOT EXISTS journal_lines (
+                id INTEGER PRIMARY KEY,
+                journal_entry_id INTEGER NOT NULL REFERENCES journal_entries(id),
+                account_id INTEGER NOT NULL REFERENCES accounts(id),
+                description TEXT NOT NULL DEFAULT '',
+                debit_minor INTEGER NOT NULL DEFAULT 0 CHECK (debit_minor >= 0),
+                credit_minor INTEGER NOT NULL DEFAULT 0 CHECK (credit_minor >= 0),
+                CHECK ((debit_minor > 0 AND credit_minor = 0) OR
+                       (credit_minor > 0 AND debit_minor = 0))
+            );
             CREATE TABLE IF NOT EXISTS sessions (
                 token_hash TEXT PRIMARY KEY,
                 user_id INTEGER NOT NULL REFERENCES users(id),
@@ -133,6 +154,8 @@ def initialize(db_path: str, initial_password: str | None = None) -> str | None:
                 created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS accounts_company_idx ON accounts(company_id);
+            CREATE INDEX IF NOT EXISTS journal_company_idx ON journal_entries(company_id, id DESC);
+            CREATE INDEX IF NOT EXISTS journal_lines_entry_idx ON journal_lines(journal_entry_id);
             CREATE INDEX IF NOT EXISTS audit_company_idx ON audit_log(company_id, id DESC);
             """
         )
@@ -440,6 +463,133 @@ def add_audit(db: sqlite3.Connection, company_id: int, user_id: int, action: str
     )
 
 
+def parse_journal_amount(value) -> int:
+    if isinstance(value, bool):
+        raise ValueError("مبلغ القيد غير صالح")
+    try:
+        amount = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        raise ValueError("أدخل مبلغًا رقميًا صحيحًا") from None
+    if not amount.is_finite() or amount <= 0 or amount > Decimal("90000000000000"):
+        raise ValueError("يجب أن يكون المبلغ أكبر من صفر وضمن الحد المسموح")
+    minor_units = amount * 100
+    if minor_units != minor_units.to_integral_value():
+        raise ValueError("المبلغ لا يقبل أكثر من منزلتين عشريتين")
+    return int(minor_units)
+
+
+def create_journal_entry(
+    db: sqlite3.Connection, company_id: int, user_id: int, payload: dict,
+) -> dict:
+    if not isinstance(payload, dict):
+        raise ValueError("بيانات القيد غير صالحة")
+    entry_date = str(payload.get("date", "")).strip()
+    try:
+        if datetime.strptime(entry_date, "%Y-%m-%d").strftime("%Y-%m-%d") != entry_date:
+            raise ValueError
+    except ValueError:
+        raise ValueError("تاريخ القيد غير صالح") from None
+    description = str(payload.get("description", "")).strip()
+    if not description or len(description) > 500:
+        raise ValueError("وصف القيد مطلوب (حتى 500 حرف)")
+    lines = payload.get("lines")
+    if not isinstance(lines, list) or not 2 <= len(lines) <= 100:
+        raise ValueError("يجب أن يتضمن القيد سطرين على الأقل وبحد أقصى 100 سطر")
+
+    prepared = []
+    debit_total = 0
+    credit_total = 0
+    for line in lines:
+        if not isinstance(line, dict):
+            raise ValueError("بيانات أحد أسطر القيد غير صالحة")
+        code = str(line.get("account_code", "")).strip()
+        if not code:
+            raise ValueError("اختر حسابًا لكل سطر")
+        debit = parse_journal_amount(line["debit"]) if line.get("debit") not in (None, "", 0, "0") else 0
+        credit = parse_journal_amount(line["credit"]) if line.get("credit") not in (None, "", 0, "0") else 0
+        if bool(debit) == bool(credit):
+            raise ValueError("يجب تحديد مبلغ مدين أو دائن واحد لكل سطر")
+        account = db.execute(
+            """SELECT id FROM accounts
+               WHERE company_id=? AND code=? AND active=1 AND is_group=0""",
+            (company_id, code),
+        ).fetchone()
+        if not account:
+            raise ValueError(f"الحساب {code} غير موجود أو غير نشط أو مجموعة رئيسية")
+        prepared.append({
+            "account_id": account["id"],
+            "description": str(line.get("description", "")).strip()[:250],
+            "debit": debit,
+            "credit": credit,
+        })
+        debit_total += debit
+        credit_total += credit
+
+    if debit_total != credit_total:
+        raise ValueError("إجمالي المدين لا يساوي إجمالي الدائن")
+    if debit_total == 0:
+        raise ValueError("يجب أن يحتوي القيد على مبلغ أكبر من صفر")
+
+    sequence = db.execute(
+        "SELECT COUNT(*) + 1 FROM journal_entries WHERE company_id=?", (company_id,)
+    ).fetchone()[0]
+    entry_number = f"JE-{sequence:06d}"
+    cursor = db.execute(
+        """INSERT INTO journal_entries(company_id,entry_number,entry_date,description,created_by,created_at)
+           VALUES(?,?,?,?,?,?)""",
+        (company_id, entry_number, entry_date, description, user_id, utc_now()),
+    )
+    for line in prepared:
+        db.execute(
+            """INSERT INTO journal_lines(journal_entry_id,account_id,description,debit_minor,credit_minor)
+               VALUES(?,?,?,?,?)""",
+            (cursor.lastrowid, line["account_id"], line["description"], line["debit"], line["credit"]),
+        )
+    add_audit(db, company_id, user_id, "journal.created",
+              {"entry_number": entry_number, "debit_minor": debit_total})
+    return {"id": cursor.lastrowid, "entry_number": entry_number, "debit_minor": debit_total}
+
+
+def trial_balance(db: sqlite3.Connection, company_id: int) -> dict:
+    rows = db.execute(
+        """SELECT a.code,a.name,a.type,a.nature,
+                  COALESCE(SUM(l.debit_minor),0) AS debit_minor,
+                  COALESCE(SUM(l.credit_minor),0) AS credit_minor
+           FROM accounts a
+           LEFT JOIN journal_lines l ON l.account_id=a.id
+           LEFT JOIN journal_entries j ON j.id=l.journal_entry_id AND j.company_id=a.company_id
+           WHERE a.company_id=? AND a.active=1 AND a.is_group=0
+           GROUP BY a.id ORDER BY a.code""",
+        (company_id,),
+    ).fetchall()
+    accounts = []
+    total_debit = 0
+    total_credit = 0
+    for row in rows:
+        net = row["debit_minor"] - row["credit_minor"]
+        debit_balance = max(net, 0)
+        credit_balance = max(-net, 0)
+        total_debit += debit_balance
+        total_credit += credit_balance
+        if row["debit_minor"] or row["credit_minor"]:
+            accounts.append({
+                "code": row["code"],
+                "name": row["name"],
+                "type": row["type"],
+                "type_label": TYPE_LABELS[row["type"]],
+                "debit_minor": row["debit_minor"],
+                "credit_minor": row["credit_minor"],
+                "debit_balance_minor": debit_balance,
+                "credit_balance_minor": credit_balance,
+            })
+    return {
+        "accounts": accounts,
+        "total_debit_minor": total_debit,
+        "total_credit_minor": total_credit,
+        "balanced": total_debit == total_credit,
+    }
+
+
 class RaseedHandler(BaseHTTPRequestHandler):
     server_version = "Raseed/1"
     imports: dict[str, dict] = {}
@@ -561,6 +711,51 @@ class RaseedHandler(BaseHTTPRequestHandler):
                             or query in (item["english_name"] or "").lower()]
             self.send_json(200, {"accounts": accounts})
             return
+        if path == "/api/journals":
+            user = self.require_permission("accounts:read")
+            if not user:
+                return
+            with connect(self.server.db_path) as db:
+                entries = db.execute(
+                    """SELECT j.id,j.entry_number,j.entry_date,j.description,j.created_at,u.name AS created_by,
+                              COALESCE(SUM(l.debit_minor),0) AS total_minor
+                       FROM journal_entries j
+                       JOIN users u ON u.id=j.created_by
+                       JOIN journal_lines l ON l.journal_entry_id=j.id
+                       WHERE j.company_id=? GROUP BY j.id ORDER BY j.id DESC LIMIT 100""",
+                    (user["company_id"],),
+                ).fetchall()
+                lines_by_entry = {}
+                if entries:
+                    entry_ids = [entry["id"] for entry in entries]
+                    placeholders = ",".join("?" for _ in entry_ids)
+                    line_rows = db.execute(
+                        f"""SELECT l.journal_entry_id,a.code,a.name,l.description,l.debit_minor,l.credit_minor
+                            FROM journal_lines l JOIN accounts a ON a.id=l.account_id
+                            WHERE l.journal_entry_id IN ({placeholders}) ORDER BY l.id""",
+                        entry_ids,
+                    ).fetchall()
+                    for line in line_rows:
+                        lines_by_entry.setdefault(line["journal_entry_id"], []).append({
+                            "code": line["code"], "name": line["name"], "description": line["description"],
+                            "debit_minor": line["debit_minor"], "credit_minor": line["credit_minor"],
+                        })
+                result = [{
+                    "id": entry["id"], "entry_number": entry["entry_number"],
+                    "date": entry["entry_date"], "description": entry["description"],
+                    "created_at": entry["created_at"], "created_by": entry["created_by"],
+                    "total_minor": entry["total_minor"], "lines": lines_by_entry.get(entry["id"], []),
+                } for entry in entries]
+            self.send_json(200, {"journals": result})
+            return
+        if path == "/api/reports/trial-balance":
+            user = self.require_permission("accounts:read")
+            if not user:
+                return
+            with connect(self.server.db_path) as db:
+                report = trial_balance(db, user["company_id"])
+            self.send_json(200, report)
+            return
         self.send_error(404)
 
     def do_POST(self):
@@ -642,6 +837,23 @@ class RaseedHandler(BaseHTTPRequestHandler):
                     return
                 add_audit(db, user["company_id"], user["id"], "account.created", {"code": account["code"]})
             self.send_json(201, {"ok": True})
+            return
+        if path == "/api/journals":
+            if not self.require_permission("accounts:write"):
+                return
+            try:
+                payload = self.read_json()
+            except ValueError as error:
+                self.send_json(400, {"error": str(error)})
+                return
+            with connect(self.server.db_path) as db:
+                try:
+                    db.execute("BEGIN IMMEDIATE")
+                    result = create_journal_entry(db, user["company_id"], user["id"], payload)
+                except (ValueError, sqlite3.IntegrityError) as error:
+                    self.send_json(400, {"error": str(error) or "تعذر حفظ القيد"})
+                    return
+            self.send_json(201, {"ok": True, **result})
             return
         if path == "/api/users":
             if not self.require_permission("users:write"):
