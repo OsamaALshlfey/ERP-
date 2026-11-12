@@ -1,7 +1,11 @@
 (() => {
   const app = document.querySelector("#app");
   const toast = document.querySelector("#toast");
-  const state = { csrf: "", user: null, data: null, page: "home", collapsed: false, query: "" };
+  const state = {
+    csrf: "", user: null, data: null, page: "home", collapsed: false, query: "",
+    journals: null, journalsLoading: false, journalsError: "",
+    trialBalance: null, trialBalanceLoading: false, trialBalanceError: "",
+  };
   const roleNames = { admin: "مدير", accountant: "محاسب", viewer: "قارئ" };
   const natureNames = { debit: "مدينة", credit: "دائنة" };
   let toastTimer;
@@ -121,6 +125,8 @@
     const links = [
       ["home", "◫", "نظرة عامة"],
       ["accounts", "▤", "دليل الحسابات"],
+      ["journal", "↔", "القيود اليومية"],
+      ["trial-balance", "▥", "ميزان المراجعة"],
       ["import", "⇧", "استيراد الدليل"],
       ...(isAdmin ? [["company", "⌂", "المنشأة"], ["users", "♙", "المستخدمون"]] : []),
     ];
@@ -150,6 +156,8 @@
 
   function pageContent() {
     if (state.page === "accounts") return accountsPage();
+    if (state.page === "journal") return journalsPage();
+    if (state.page === "trial-balance") return trialBalancePage();
     if (state.page === "import") return importPage();
     if (state.page === "company") return companyPage();
     if (state.page === "users") return usersPage();
@@ -167,7 +175,7 @@
       ? `<div class="activity-list">${state.data.audits.map((item) => `<div class="activity-row"><span class="activity-dot"></span><span><b>${auditLabel(item.action)}</b><small>${escapeHtml(formatDate(item.created_at))}</small></span></div>`).join("")}</div>`
       : `<div class="empty-state compact"><span class="empty-icon">◷</span><b>لا توجد عمليات مسجلة بعد</b><span>ستظهر هنا التغييرات الحساسة على المنشأة والحسابات.</span></div>`;
     return `
-      ${pageHeading("مساحة العمل", "أهلًا بك في رصيد", "ملخص مساحة منشأتك التجريبية. لا توجد حركات أو أرصدة محاسبية في هذه المرحلة.",
+      ${pageHeading("مساحة العمل", "أهلًا بك في رصيد", "أدر دليل الحسابات، وسجل القيود اليومية المتوازنة، وراجع ميزان المراجعة.",
         `<span class="updated-label">آخر تحديث: ${escapeHtml(formatDate(state.data.updated_at))}</span>`)}
       <section class="metric-grid">
         <article class="metric-card"><span class="metric-icon green">▤</span><span class="metric-label">حسابات الدليل</span><strong>${state.data.accounts.length}</strong><small>عدد الحسابات المسجلة</small></article>
@@ -176,11 +184,91 @@
       </section>
       <div class="home-grid">
         <section class="panel"><div class="panel-heading"><div><h2>ابدأ إعداد المنشأة</h2><p>أضف دليل الحسابات أو استورده بعد مراجعته.</p></div><span class="step-badge">المرحلة ١</span></div>
-          <div class="setup-steps"><button data-page="company"><span>١</span><b>راجع بيانات المنشأة</b><small>اسم المنشأة وعملة العرض</small><i>←</i></button><button data-page="accounts"><span>٢</span><b>أضف الحسابات</b><small>رموز وأسماء وأنواع واضحة</small><i>←</i></button><button data-page="import"><span>٣</span><b>استورد ملفًا</b><small>معاينة قبل إضافة الحسابات</small><i>←</i></button></div>
+          <div class="setup-steps"><button data-page="company"><span>١</span><b>راجع بيانات المنشأة</b><small>اسم المنشأة وعملة العرض</small><i>←</i></button><button data-page="accounts"><span>٢</span><b>أضف الحسابات</b><small>رموز وأسماء وأنواع واضحة</small><i>←</i></button><button data-page="journal"><span>٣</span><b>سجل قيدًا يوميًا</b><small>مدين ودائن متساويان</small><i>←</i></button></div>
         </section>
         <section class="panel"><div class="panel-heading"><div><h2>سجل النشاط</h2><p>آخر تغييرات مسجلة في المنشأة</p></div><span class="subtle-count">${state.data.audits.length}</span></div>${audits}</section>
       </div>
-      <div class="notice info"><span>ⓘ</span><p>إعداد القيود الآلية والمخزون متوقف حتى اعتماد سياسات التقييم والضرائب والحسابات المطلوبة.</p></div>`;
+      <div class="notice info"><span>ⓘ</span><p>القيود اليدوية المتوازنة وميزان المراجعة متاحان. القيود الآلية والمخزون والضرائب تحتاج إعدادات وسياسات منفصلة.</p></div>`;
+  }
+
+  function amount(minor) {
+    const formatted = new Intl.NumberFormat("ar-SA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+      .format(minor / 100);
+    return `${formatted} ${escapeHtml(state.data.company.currency)}`;
+  }
+
+  function journalsPage() {
+    const heading = pageHeading("المحاسبة", "القيود اليومية", "سجل القيود المتوازنة على حسابات الحركة. القيود المحفوظة لا يمكن تعديلها أو حذفها.");
+    if (state.journalsError) {
+      return `${heading}<div class="alert error">${escapeHtml(state.journalsError)}</div><button id="retry-journals" class="button secondary">إعادة المحاولة</button>`;
+    }
+    if (state.journalsLoading || !state.journals) {
+      return `${heading}<div class="panel"><div class="empty-state compact">جارٍ تحميل القيود…</div></div>`;
+    }
+    const postingAccounts = state.data.accounts.filter((item) => item.active && !item.is_group);
+    const accountOptions = postingAccounts.map((item) =>
+      `<option value="${escapeHtml(item.code)}">${escapeHtml(item.code)} — ${escapeHtml(item.name)}</option>`).join("");
+    const rows = state.journals.map((entry) => {
+      const lines = entry.lines.map((line) => `<tr><td class="code-cell">${escapeHtml(line.code)}</td>
+        <td>${escapeHtml(line.name)}</td><td>${escapeHtml(line.description || "—")}</td>
+        <td>${line.debit_minor ? amount(line.debit_minor) : "—"}</td>
+        <td>${line.credit_minor ? amount(line.credit_minor) : "—"}</td></tr>`).join("");
+      return `<tr><td class="code-cell">${escapeHtml(entry.entry_number)}</td><td>${escapeHtml(entry.date)}</td>
+        <td>${escapeHtml(entry.description)}</td><td>${amount(entry.total_minor)}</td>
+        <td><details class="journal-details"><summary>عرض السطور (${entry.lines.length})</summary>
+          <div class="table-wrap"><table><thead><tr><th>الحساب</th><th>الاسم</th><th>البيان</th><th>مدين</th><th>دائن</th></tr></thead><tbody>${lines}</tbody></table></div>
+        </details></td></tr>`;
+    }).join("");
+    const form = state.user.role !== "viewer" ? `
+      <section class="panel form-panel"><div class="panel-heading"><div><h2>قيد يومي جديد</h2>
+        <p>لن يُحفظ القيد إلا إذا تساوى إجمالي المدين والدائن.</p></div></div>
+        ${postingAccounts.length < 2 ? `<div class="notice warning"><span>!</span><p>أضف حسابي حركة نشطين على الأقل إلى دليل الحسابات قبل تسجيل قيد.</p></div>` : ""}
+        <form id="journal-form" class="stack">
+          <div class="form-grid journal-meta">
+            <label>تاريخ القيد<input name="date" type="date" required value="${new Date().toISOString().slice(0, 10)}"></label>
+            <label class="journal-description">وصف القيد<input name="description" maxlength="500" required placeholder="سبب العملية أو مرجعها"></label>
+          </div>
+          <div class="journal-lines-heading"><b>سطور القيد</b><button id="add-journal-line" class="button secondary" type="button">إضافة سطر</button></div>
+          <div id="journal-lines">${journalLine(accountOptions)}${journalLine(accountOptions)}</div>
+          <div class="button-row"><button class="button primary" type="submit" ${postingAccounts.length < 2 ? "disabled" : ""}>حفظ وترحيل القيد</button></div>
+        </form>
+      </section>` : "";
+    return `${heading}${form}
+      <section class="panel table-panel"><div class="panel-heading"><div><h2>القيود المسجلة</h2>
+        <p>أحدث 100 قيد، مرتبة من الأحدث.</p></div><span class="subtle-count">${state.journals.length}</span></div>
+        ${state.journals.length ? `<div class="table-wrap"><table><thead><tr><th>رقم القيد</th><th>التاريخ</th><th>البيان</th><th>الإجمالي</th><th>التفاصيل</th></tr></thead><tbody>${rows}</tbody></table></div>`
+        : `<div class="empty-state"><span class="empty-icon">↔</span><b>لا توجد قيود مسجلة</b><span>ابدأ بتسجيل أول قيد يومي متوازن.</span></div>`}
+      </section>`;
+  }
+
+  function journalLine(accountOptions) {
+    return `<div class="journal-line"><label>حساب الحركة<select class="line-account" required><option value="">اختر الحساب</option>${accountOptions}</select></label>
+      <label>الجانب<select class="line-side"><option value="debit">مدين</option><option value="credit">دائن</option></select></label>
+      <label>المبلغ<input class="line-amount" type="number" min="0.01" step="0.01" required placeholder="0.00" dir="ltr"></label>
+      <label>بيان السطر<input class="line-description" maxlength="250" placeholder="اختياري"></label>
+      <button class="icon-button remove-journal-line" type="button" aria-label="حذف السطر">×</button></div>`;
+  }
+
+  function trialBalancePage() {
+    const heading = pageHeading("التقارير", "ميزان المراجعة", "أرصدة الحسابات النشطة من القيود المرحلة. يجب أن يتساوى إجمالي الأرصدة المدينة والدائنة.");
+    if (state.trialBalanceError) {
+      return `${heading}<div class="alert error">${escapeHtml(state.trialBalanceError)}</div><button id="retry-trial-balance" class="button secondary">إعادة المحاولة</button>`;
+    }
+    if (state.trialBalanceLoading || !state.trialBalance) {
+      return `${heading}<div class="panel"><div class="empty-state compact">جارٍ إعداد التقرير…</div></div>`;
+    }
+    const report = state.trialBalance;
+    const rows = report.accounts.map((account) => `<tr><td class="code-cell">${escapeHtml(account.code)}</td>
+      <td>${escapeHtml(account.name)}</td><td>${escapeHtml(account.type_label)}</td>
+      <td>${amount(account.debit_minor)}</td><td>${amount(account.credit_minor)}</td>
+      <td>${amount(account.debit_balance_minor)}</td><td>${amount(account.credit_balance_minor)}</td></tr>`).join("");
+    return `${heading}<section class="panel table-panel">
+      <div class="panel-heading"><div><h2>الأرصدة حتى تاريخه</h2><p>يعرض الحسابات ذات الحركة فقط.</p></div>
+        <span class="state-badge ${report.balanced ? "enabled" : "disabled"}">${report.balanced ? "متوازن" : "غير متوازن"}</span></div>
+      ${report.accounts.length ? `<div class="table-wrap"><table><thead><tr><th>الرمز</th><th>الحساب</th><th>النوع</th><th>إجمالي مدين</th><th>إجمالي دائن</th><th>رصيد مدين</th><th>رصيد دائن</th></tr></thead>
+        <tbody>${rows}</tbody><tfoot><tr><th colspan="5">إجمالي الأرصدة</th><th>${amount(report.total_debit_minor)}</th><th>${amount(report.total_credit_minor)}</th></tr></tfoot></table></div>`
+        : `<div class="empty-state"><span class="empty-icon">▥</span><b>لا توجد حركات محاسبية</b><span>سجّل قيدًا يوميًا لعرض الأرصدة هنا.</span></div>`}
+      </section>`;
   }
 
   function accountsPage() {
@@ -261,6 +349,14 @@
     bindCompanyForm();
     bindUserForm();
     bindImportForm();
+    bindJournalForm();
+    if (state.page === "journal" && !state.journals && !state.journalsLoading && !state.journalsError) loadJournals();
+    if (state.page === "trial-balance" && !state.trialBalance && !state.trialBalanceLoading
+        && !state.trialBalanceError) loadTrialBalance();
+    const retryJournals = document.querySelector("#retry-journals");
+    if (retryJournals) retryJournals.onclick = () => { state.journalsError = ""; loadJournals(); };
+    const retryTrialBalance = document.querySelector("#retry-trial-balance");
+    if (retryTrialBalance) retryTrialBalance.onclick = () => { state.trialBalanceError = ""; loadTrialBalance(); };
     const file = document.querySelector("#import-file");
     if (file) file.addEventListener("change", () => {
       const label = document.querySelector("#file-name");
@@ -310,6 +406,66 @@
         body: JSON.stringify(Object.fromEntries(new FormData(form))),
       }), "تمت إضافة المستخدم");
     };
+  }
+
+  function bindJournalForm() {
+    const form = document.querySelector("#journal-form");
+    if (!form) return;
+    document.querySelector("#add-journal-line").onclick = () => {
+      const options = form.querySelector(".line-account").innerHTML;
+      document.querySelector("#journal-lines").insertAdjacentHTML("beforeend", journalLine(options));
+    };
+    form.addEventListener("click", (event) => {
+      if (event.target.closest(".remove-journal-line")) {
+        event.target.closest(".journal-line").remove();
+      }
+    });
+    form.onsubmit = async (event) => {
+      event.preventDefault();
+      const fields = Object.fromEntries(new FormData(form));
+      fields.lines = Array.from(form.querySelectorAll(".journal-line"), (row) => {
+        const amountValue = row.querySelector(".line-amount").value;
+        const side = row.querySelector(".line-side").value;
+        return {
+          account_code: row.querySelector(".line-account").value,
+          description: row.querySelector(".line-description").value,
+          debit: side === "debit" ? amountValue : "0",
+          credit: side === "credit" ? amountValue : "0",
+        };
+      });
+      await submitForm(form, async () => request("/api/journals", {
+        method: "POST", headers: { "X-CSRF-Token": state.csrf }, body: JSON.stringify(fields),
+      }), "تم حفظ القيد وترحيله");
+      state.journals = null;
+      state.trialBalance = null;
+    };
+  }
+
+  async function loadJournals() {
+    state.journalsLoading = true;
+    render();
+    try {
+      const result = await request("/api/journals");
+      state.journals = result.journals;
+    } catch (error) {
+      state.journalsError = error.message;
+    } finally {
+      state.journalsLoading = false;
+      if (state.page === "journal") render();
+    }
+  }
+
+  async function loadTrialBalance() {
+    state.trialBalanceLoading = true;
+    render();
+    try {
+      state.trialBalance = await request("/api/reports/trial-balance");
+    } catch (error) {
+      state.trialBalanceError = error.message;
+    } finally {
+      state.trialBalanceLoading = false;
+      if (state.page === "trial-balance") render();
+    }
   }
 
   async function submitForm(form, action, success) {
