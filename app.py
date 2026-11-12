@@ -95,13 +95,13 @@ def initialize(db_path: str, initial_password: str | None = None) -> str | None:
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY,
                 company_id INTEGER NOT NULL REFERENCES companies(id),
-                email TEXT NOT NULL COLLATE NOCASE,
+                email TEXT NOT NULL COLLATE NOCASE UNIQUE,
                 name TEXT NOT NULL,
                 password_hash TEXT NOT NULL,
                 role TEXT NOT NULL CHECK (role IN ('admin','accountant','viewer')),
                 active INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
-                UNIQUE(company_id, email)
+                CHECK (length(email) > 3)
             );
             CREATE TABLE IF NOT EXISTS accounts (
                 id INTEGER PRIMARY KEY,
@@ -294,6 +294,7 @@ def preview_accounts(db: sqlite3.Connection, company_id: int, rows: list[dict]) 
     seen = set()
     candidates = {}
     issues = []
+    matched = 0
     for row in rows:
         code = str(row.get("code", "")).strip()
         issue = None
@@ -339,6 +340,7 @@ def preview_accounts(db: sqlite3.Connection, company_id: int, rows: list[dict]) 
                 and bool(old["active"]) == bool(candidate["active"])
             )
             if same:
+                matched += 1
                 continue
             issues.append({"row": candidate["_row"], "sheet": candidate["_sheet"], "code": code,
                            "reason": "الحساب موجود ببيانات مختلفة؛ لم يتم تغييره"})
@@ -397,14 +399,38 @@ def preview_accounts(db: sqlite3.Connection, company_id: int, rows: list[dict]) 
         "expected": len(rows),
         "read": len(rows),
         "new": len(planned),
-        "matched": len(rows) - len(candidates) - sum(
-            1 for issue in issues if issue["reason"] == "رمز الحساب مكرر في الملف"
-        ),
+        "matched": matched,
         "skipped": len(issues),
         "failed": len(issues),
         "issues": issues,
         "accounts": planned,
     }
+
+
+def commit_accounts(db: sqlite3.Connection, company_id: int, user_id: int, rows: list[dict]) -> dict:
+    result = preview_accounts(db, company_id, rows)
+    parent_ids = {row["code"]: row["id"] for row in db.execute(
+        "SELECT id,code FROM accounts WHERE company_id=?", (company_id,)
+    )}
+    pending = {item["code"]: item for item in result["accounts"]}
+    while pending:
+        ready = [item for item in pending.values()
+                 if not item["parent_code"] or item["parent_code"] in parent_ids]
+        if not ready:
+            raise ValueError("تعذر ترتيب الحسابات؛ راجع روابط الحسابات الرئيسية")
+        for item in ready:
+            parent_id = parent_ids.get(item["parent_code"])
+            cursor = db.execute(
+                """INSERT INTO accounts(company_id,code,name,english_name,type,nature,parent_id,is_group,active,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (company_id, item["code"], item["name"], item["english_name"], item["type"],
+                 item["nature"], parent_id, item["is_group"], item["active"], utc_now()),
+            )
+            parent_ids[item["code"]] = cursor.lastrowid
+            del pending[item["code"]]
+    add_audit(db, company_id, user_id, "accounts.imported",
+              {"created": result["new"], "matched": result["matched"], "skipped": result["skipped"]})
+    return result
 
 
 def add_audit(db: sqlite3.Connection, company_id: int, user_id: int, action: str, details: dict):
@@ -692,29 +718,7 @@ class RaseedHandler(BaseHTTPRequestHandler):
                 if staged["company_id"] != user["company_id"] or staged["user_id"] != user["id"]:
                     raise ValueError("المعاينة غير صالحة لهذا المستخدم")
                 with connect(self.server.db_path) as db:
-                    result = preview_accounts(db, user["company_id"], staged["rows"])
-                    parent_ids = {row["code"]: row["id"] for row in db.execute(
-                        "SELECT id,code FROM accounts WHERE company_id=?", (user["company_id"],)
-                    )}
-                    pending = {item["code"]: item for item in result["accounts"]}
-                    # Insert parents before children, independent of spreadsheet row order.
-                    while pending:
-                        ready = [item for item in pending.values()
-                                 if not item["parent_code"] or item["parent_code"] in parent_ids]
-                        if not ready:
-                            raise ValueError("تعذر ترتيب الحسابات؛ راجع روابط الحسابات الرئيسية")
-                        for item in ready:
-                            parent_id = parent_ids.get(item["parent_code"])
-                            cursor = db.execute(
-                                """INSERT INTO accounts(company_id,code,name,english_name,type,nature,parent_id,is_group,active,created_at)
-                                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                                (user["company_id"], item["code"], item["name"], item["english_name"], item["type"],
-                                 item["nature"], parent_id, item["is_group"], item["active"], utc_now()),
-                            )
-                            parent_ids[item["code"]] = cursor.lastrowid
-                            del pending[item["code"]]
-                    add_audit(db, user["company_id"], user["id"], "accounts.imported",
-                              {"created": result["new"], "matched": result["matched"], "skipped": result["skipped"]})
+                    result = commit_accounts(db, user["company_id"], user["id"], staged["rows"])
                 self.imports.pop(preview_id, None)
                 self.send_json(200, {"created": result["new"], "matched": result["matched"],
                                      "skipped": result["skipped"], "failed": result["failed"],
