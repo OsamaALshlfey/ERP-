@@ -117,6 +117,83 @@ class AccountImportTests(unittest.TestCase):
         self.assertEqual(xlsx_metadata, {"sheets": 1, "columns": 4, "rows": 1})
 
 
+class JournalEntryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.temp.name) / "journal.sqlite3")
+        app.initialize(self.db_path, "InitialSyntheticPass12")
+        with app.connect(self.db_path) as db:
+            self.company_id = db.execute("SELECT id FROM companies").fetchone()["id"]
+            self.user_id = db.execute("SELECT id FROM users").fetchone()["id"]
+            for code, name, kind, is_group in (
+                ("1000", "الصندوق", "asset", 0),
+                ("4000", "الإيرادات", "revenue", 0),
+                ("9000", "مجموعة رئيسية", "asset", 1),
+            ):
+                db.execute(
+                    """INSERT INTO accounts(company_id,code,name,type,nature,is_group,created_at)
+                       VALUES(?,?,?,?,?,?,?)""",
+                    (self.company_id, code, name, kind,
+                     "debit" if kind == "asset" else "credit", is_group, app.utc_now()),
+                )
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_balanced_journal_posts_and_updates_trial_balance(self):
+        payload = {
+            "date": "2026-11-12",
+            "description": "إثبات إيراد تجريبي",
+            "lines": [
+                {"account_code": "1000", "debit": "125.50"},
+                {"account_code": "4000", "credit": "125.50"},
+            ],
+        }
+        with app.connect(self.db_path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            result = app.create_journal_entry(db, self.company_id, self.user_id, payload)
+            report = app.trial_balance(db, self.company_id)
+            self.assertEqual(result["entry_number"], "JE-000001")
+            self.assertEqual(result["debit_minor"], 12550)
+            self.assertTrue(report["balanced"])
+            self.assertEqual(report["total_debit_minor"], 12550)
+            self.assertEqual(report["total_credit_minor"], 12550)
+            self.assertEqual(len(report["accounts"]), 2)
+
+    def test_unbalanced_or_non_posting_lines_are_rejected_without_writes(self):
+        invalid_payloads = (
+            {
+                "date": "2026-11-12", "description": "قيد غير متوازن",
+                "lines": [
+                    {"account_code": "1000", "debit": "10"},
+                    {"account_code": "4000", "credit": "9"},
+                ],
+            },
+            {
+                "date": "2026-11-12", "description": "استخدام مجموعة",
+                "lines": [
+                    {"account_code": "9000", "debit": "10"},
+                    {"account_code": "4000", "credit": "10"},
+                ],
+            },
+            {
+                "date": "2026-11-12", "description": "دقة مبلغ غير صالحة",
+                "lines": [
+                    {"account_code": "1000", "debit": "10.001"},
+                    {"account_code": "4000", "credit": "10.001"},
+                ],
+            },
+        )
+        for payload in invalid_payloads:
+            with self.subTest(description=payload["description"]):
+                with app.connect(self.db_path) as db:
+                    with self.assertRaises(ValueError):
+                        app.create_journal_entry(db, self.company_id, self.user_id, payload)
+                    self.assertEqual(
+                        db.execute("SELECT COUNT(*) FROM journal_entries").fetchone()[0], 0,
+                    )
+
+
 class HttpApplicationTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -168,9 +245,48 @@ class HttpApplicationTests(unittest.TestCase):
                       {"Content-Type": "application/json"}, opener)
         self.assertEqual(forbidden.exception.code, 403)
         self.assertIn("csrf", forbidden.exception.read().decode())
-        saved = self.call("/api/company", "POST", b'{"name":"منشأة معدلة"}',
+        saved = self.call("/api/company", "POST", json.dumps({"name": "منشأة معدلة"}).encode(),
                           {"Content-Type": "application/json", "X-CSRF-Token": csrf}, opener)
         self.assertEqual(saved.status, 200)
+
+    def test_journal_api_posts_balanced_entry_and_returns_trial_balance(self):
+        with app.connect(self.db_path) as db:
+            company_id = db.execute("SELECT id FROM companies").fetchone()["id"]
+            for code, name, kind, nature in (
+                ("1000", "الصندوق", "asset", "debit"),
+                ("4000", "الإيرادات", "revenue", "credit"),
+            ):
+                db.execute(
+                    """INSERT INTO accounts(company_id,code,name,type,nature,created_at)
+                       VALUES(?,?,?,?,?,?)""",
+                    (company_id, code, name, kind, nature, app.utc_now()),
+                )
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor())
+        login = self.call(
+            "/api/login", "POST",
+            json.dumps({"email": "admin@raseed.local", "password": "InitialSyntheticPass12"}).encode(),
+            {"Content-Type": "application/json"}, opener,
+        )
+        csrf = json.loads(login.read())["csrf_token"]
+        response = self.call(
+            "/api/journals", "POST",
+            json.dumps({
+                "date": "2026-11-12", "description": "قيد تجريبي",
+                "lines": [
+                    {"account_code": "1000", "debit": "25.75"},
+                    {"account_code": "4000", "credit": "25.75"},
+                ],
+            }).encode(),
+            {"Content-Type": "application/json", "X-CSRF-Token": csrf}, opener,
+        )
+        self.assertEqual(response.status, 201)
+        self.assertEqual(json.loads(response.read())["entry_number"], "JE-000001")
+        report = self.call("/api/reports/trial-balance", opener=opener)
+        report_data = json.loads(report.read())
+        self.assertTrue(report_data["balanced"])
+        self.assertEqual(report_data["total_debit_minor"], 2575)
+        journals = self.call("/api/journals", opener=opener)
+        self.assertEqual(len(json.loads(journals.read())["journals"]), 1)
 
 
 if __name__ == "__main__":

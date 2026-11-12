@@ -478,6 +478,17 @@ def parse_journal_amount(value) -> int:
     return int(minor_units)
 
 
+def parse_optional_journal_amount(value) -> int:
+    if value is None or value == "":
+        return 0
+    try:
+        if Decimal(str(value)) == 0:
+            return 0
+    except (InvalidOperation, ValueError):
+        pass
+    return parse_journal_amount(value)
+
+
 def create_journal_entry(
     db: sqlite3.Connection, company_id: int, user_id: int, payload: dict,
 ) -> dict:
@@ -505,8 +516,8 @@ def create_journal_entry(
         code = str(line.get("account_code", "")).strip()
         if not code:
             raise ValueError("اختر حسابًا لكل سطر")
-        debit = parse_journal_amount(line["debit"]) if line.get("debit") not in (None, "", 0, "0") else 0
-        credit = parse_journal_amount(line["credit"]) if line.get("credit") not in (None, "", 0, "0") else 0
+        debit = parse_optional_journal_amount(line.get("debit"))
+        credit = parse_optional_journal_amount(line.get("credit"))
         if bool(debit) == bool(credit):
             raise ValueError("يجب تحديد مبلغ مدين أو دائن واحد لكل سطر")
         account = db.execute(
